@@ -1,0 +1,137 @@
+namespace Livt.FileSystems
+
+/**
+ * Validated FAT32 layout, independent of USB and board clocks. Borrows a complete
+ * boot sector during Parse. All derived addresses remain inside the selected
+ * partition. Only 512-byte sectors and power-of-two clusters through 32 KiB are
+ * supported. Honors the active FAT when mirroring is disabled.
+ */
+component Fat32Geometry
+{
+	// Published layout; usable only after Parse returns true.
+	public fatStart: uint
+	public dataStart: uint
+	public clusterCount: uint
+	public rootCluster: uint
+	public clusterShift: int
+	public sectorsPerCluster: uint
+
+	// Exclusive upper bound for data-cluster validation.
+	clusterLimit: uint
+
+	/**
+	 * Parses a retained valid boot sector using serialized scheduled reads.
+	 * start is its absolute LBA; length is the partition size in 512-byte blocks.
+	 * The caller must first bound that range within the device and uint addresses.
+	 * True publishes usable geometry. False may leave partial fields; do not use them.
+	 */
+	public fn Parse(sector: ISectorBuffer, start: uint, length: uint) bool
+	{
+		if (sector.Read16(510) != 0xAA55 || sector.Read16(11) != 512
+			|| sector.Read16(17) != 0 || sector.Read16(19) != 0
+			|| sector.Read16(22) != 0 || sector.Read16(42) != 0) {
+			return false
+		}
+
+		sectorsPerCluster = sector.ReadByte(13) as uint
+		var reserved = sector.Read16(14)
+		var copies = sector.ReadByte(16) as uint
+		var total = sector.Read32(32)
+		var fatSize = sector.Read32(36)
+		var flags = sector.Read16(40)
+		rootCluster = sector.Read32(44)
+
+		if (sectorsPerCluster == 0 || sectorsPerCluster > 64
+			|| (sectorsPerCluster & (sectorsPerCluster - 1)) != 0
+			|| reserved == 0 || copies < 1 || copies > 2 || fatSize == 0
+			|| total > length || reserved >= total) {
+			return false
+		}
+
+		var fatLimit = total - reserved
+
+		if (copies == 2) {
+			fatLimit = fatLimit >> 1
+		}
+
+		if (fatSize > fatLimit) {
+			return false
+		}
+
+		var fatSectors = fatSize
+
+		if (copies == 2) {
+			fatSectors = fatSize << 1
+		}
+
+		var overhead = reserved + fatSectors
+
+		if (overhead >= total) {
+			return false
+		}
+
+		clusterShift = 0
+		var span = sectorsPerCluster
+
+		while (span > 1) {
+			span = span >> 1
+			clusterShift++
+		}
+
+		var dataSectors = total - overhead
+		clusterCount = dataSectors >> clusterShift
+
+		if (clusterCount < 65525 || clusterCount > 0x0FFFFFEE) {
+			return false
+		}
+
+		var lastFatEntry = clusterCount + 1
+		var lastFatSector = lastFatEntry >> 7
+		clusterLimit = clusterCount + 2
+
+		if (lastFatSector >= fatSize || !IsCluster(rootCluster)) {
+			return false
+		}
+
+		var active: uint = 0
+
+		if ((flags & 128) != 0) {
+			active = flags & 15
+		}
+
+		if (active >= copies) {
+			return false
+		}
+
+		fatStart = start + reserved
+
+		if (active == 1) {
+			fatStart = fatStart + fatSize
+		}
+
+		dataStart = start + overhead
+		return true
+	}
+
+	/**
+	 * Reports whether a value names a data cluster after a successful Parse.
+	 */
+	public fn IsCluster(cluster: uint) bool
+	{
+		if (cluster < 2) {
+			return false
+		}
+
+		return cluster < clusterLimit
+	}
+
+	/**
+	 * Requires a successful Parse and IsCluster(cluster); returns the first data LBA.
+	 */
+	public fn ClusterLba(cluster: uint) uint
+	{
+		var index = cluster - 2
+		var offset = index << clusterShift
+		return dataStart + offset
+	}
+}

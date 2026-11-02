@@ -1,0 +1,321 @@
+namespace Livt.FileSystems
+
+using Livt.Utils.Hashing
+
+/**
+ * Internal scheduled parser phases.
+ */
+enum PartitionPhase
+{
+	Mbr
+	GptHeader
+	HeaderCrc
+	TableCrc
+	TableEntry
+}
+
+/**
+ * Bounded partition discovery using a borrowed sector buffer. Supports a FAT32
+ * superfloppy, first primary MBR FAT32 partition, or first GPT Basic Data/EFI
+ * partition. GPT uses 128-byte entries and at most MAX_GPT_ENTRIES; primary header
+ * and complete entry-array CRC32 must pass. No backup recovery or extended MBR.
+ * The 32-bit block API rejects GPT addresses with nonzero high words.
+ * One scheduled owner serializes calls and services the shared sector buffer.
+ * Both share a clock/reset context; start/length are usable only after Success.
+ */
+component PartitionReader<MAX_GPT_ENTRIES: int = 128>
+{
+	static assert MAX_GPT_ENTRIES > 0 && MAX_GPT_ENTRIES <= 4096, "Bound GPT table storage and scanning"
+
+	// Borrowed sector buffer and owned IEEE CRC32 helper.
+	sector: ISectorBuffer
+	crc: Crc
+
+	// Retained result and selected absolute block range.
+	public result: FileResult
+	public start: uint
+	public length: uint
+
+	// Discovery cursor and bounded GPT header/table checksum state.
+	capacity: uint
+	phase: PartitionPhase
+	index: int
+	headerSize: uint
+	expectedCrc: uint
+	runningCrc: logic[32]
+	tableLba: uint
+	tableBytes: uint
+	tableOffset: uint
+	firstUsable: uint
+	lastUsable: uint
+	selected: bool
+
+	/**
+	 * Borrows the caller's buffer; caller services it before calling Service.
+	 */
+	new(sector: ISectorBuffer)
+	{
+		this.sector = sector
+		crc = new Crc()
+	}
+
+	/**
+	 * Starts discovery for capacity 512-byte blocks, discarding the previous layout.
+	 * Requires exclusive ownership and an idle sector buffer. Call sector.Service
+	 * before this parser's Service until result is terminal. Zero capacity fails.
+	 * Cancellation is owned by the caller, which cancels and drains the sector buffer.
+	 */
+	public fn Start(capacity: uint)
+	{
+		this.capacity = capacity
+		start = 0
+		length = 0
+		selected = false
+		result = FileResult.Active
+		Request(0, PartitionPhase.Mbr)
+	}
+
+	/**
+	 * Issues a single sector request and records the next parsing phase.
+	 */
+	fn Request(lba: uint, next: PartitionPhase)
+	{
+		if (lba >= capacity || !sector.Start(lba)) {
+			result = FileResult.IoError
+		} else {
+			phase = next
+		}
+	}
+
+	/**
+	 * Validates a nonempty range using subtraction before addition.
+	 */
+	fn InRange[](first: uint, count: uint) bool
+	{
+		return first < capacity && count > 0 && count <= capacity - first
+	}
+
+	/**
+	 * Chooses a primary FAT32 partition, GPT, or an unpartitioned boot sector.
+	 */
+	fn ParseMbr()
+	{
+		if (sector.Read16(510) != 0xAA55) {
+			result = FileResult.Corrupt
+			return
+		}
+
+		var offset = 446
+
+		for (var entry: byte = 0; entry < 4; entry++) {
+			var kind = sector.ReadByte(offset + 4)
+
+			if (kind == 0xEE) {
+				Request(1, PartitionPhase.GptHeader)
+				return
+			}
+
+			if (kind == 0x0B || kind == 0x0C) {
+				start = sector.Read32(offset + 8)
+				length = sector.Read32(offset + 12)
+				result = FileResult.Corrupt
+
+				if (start > 0 && InRange(start, length)) {
+					result = FileResult.Success
+				}
+
+				return
+			}
+
+			offset = offset + 16
+		}
+
+		if (sector.Read16(11) == 512) {
+			start = 0
+			length = capacity
+			result = FileResult.Success
+		} else {
+			result = FileResult.Unsupported
+		}
+	}
+
+	/**
+	 * Bounds all GPT arithmetic before calculating CRC or following addresses.
+	 */
+	fn ParseGpt()
+	{
+		headerSize = sector.Read32(12)
+		expectedCrc = sector.Read32(16)
+		firstUsable = sector.Read32(40)
+		lastUsable = sector.Read32(48)
+		tableLba = sector.Read32(72)
+		var entries = sector.Read32(80)
+		var lastBlock = capacity - 1
+
+		if (sector.Read32(0) != 0x20494645 || sector.Read32(4) != 0x54524150
+			|| sector.Read32(8) != 0x00010000 || headerSize < 92 || headerSize > 512
+			|| sector.Read32(20) != 0 || sector.Read32(24) != 1
+			|| sector.Read32(28) != 0 || sector.Read32(36) != 0
+			|| sector.Read32(32) != lastBlock || sector.Read32(44) != 0
+			|| sector.Read32(52) != 0 || sector.Read32(76) != 0
+			|| firstUsable < 34 || lastUsable < firstUsable || lastUsable >= lastBlock
+			|| tableLba < 2 || tableLba >= firstUsable) {
+			result = FileResult.Corrupt
+			return
+		}
+
+		if (sector.Read32(84) != 128 || entries == 0 || entries > (MAX_GPT_ENTRIES as uint)) {
+			result = FileResult.Unsupported
+			return
+		}
+
+		tableBytes = entries * 128
+
+		var roundedBytes = tableBytes + 511
+		var tableSectors = roundedBytes >> 9
+		var tableSpace = firstUsable - tableLba
+
+		if (tableSectors > tableSpace) {
+			result = FileResult.Corrupt
+			return
+		}
+
+		index = 0
+		runningCrc = 0xFFFFFFFF
+		phase = PartitionPhase.HeaderCrc
+	}
+
+	/**
+	 * Validates the primary header CRC with its CRC field treated as zero.
+	 */
+	fn HeaderCrc()
+	{
+		var value = sector.ReadByte(index)
+
+		if (index >= 16 && index < 20) {
+			value = 0
+		}
+
+		runningCrc = crc.UpdateByte(runningCrc, value)
+		index++
+
+		if ((index as uint) == headerSize) {
+			var finalized = (runningCrc ^ 0xFFFFFFFF) as uint
+
+			if (finalized != expectedCrc) {
+				result = FileResult.Corrupt
+				return
+			}
+
+			expectedCrc = sector.Read32(88)
+			runningCrc = 0xFFFFFFFF
+			tableOffset = 0
+			index = 0
+			Request(tableLba, PartitionPhase.TableCrc)
+		}
+	}
+
+	/**
+	 * Includes every declared entry byte, including unused entries, in the CRC.
+	 */
+	fn TableCrc()
+	{
+		runningCrc = crc.UpdateByte(runningCrc, sector.ReadByte(index))
+		index++
+		tableOffset++
+
+		if (index == 512 || tableOffset == tableBytes) {
+			index = 0
+			phase = PartitionPhase.TableEntry
+		}
+	}
+
+	/**
+	 * Inspects one entry after hashing its sector; selects the first supported type.
+	 */
+	fn TableEntry()
+	{
+		var type0 = sector.Read32(index)
+		var type1 = sector.Read32(index + 4)
+		var type2 = sector.Read32(index + 8)
+		var type3 = sector.Read32(index + 12)
+		var basic = type0 == 0xEBD0A0A2 && type1 == 0x4433B9E5
+			&& type2 == 0xB668C087 && type3 == 0xC79926B7
+		var efi = type0 == 0xC12A7328 && type1 == 0x11D2F81F
+			&& type2 == 0xA0004BBA && type3 == 0x3BC93EC9
+
+		if (!selected && (basic || efi)) {
+			start = sector.Read32(index + 32)
+			var end = sector.Read32(index + 40)
+
+			if (sector.Read32(index + 36) != 0 || sector.Read32(index + 44) != 0
+				|| start < firstUsable || end > lastUsable || end < start) {
+				result = FileResult.Corrupt
+				return
+			}
+
+			length = end - start + 1
+			selected = true
+		}
+
+		index = index + 128
+		var used = ((tableOffset - 1) & 511) + 1
+
+		if ((index as uint) < used) {
+			return
+		}
+
+		var finalized = (runningCrc ^ 0xFFFFFFFF) as uint
+
+		if (tableOffset < tableBytes) {
+			tableLba++
+			index = 0
+			Request(tableLba, PartitionPhase.TableCrc)
+		} elif (finalized != expectedCrc) {
+			result = FileResult.Corrupt
+		} elif (!selected) {
+			result = FileResult.Unsupported
+		} else {
+			result = FileResult.Success
+		}
+	}
+
+	/**
+	 * Advances one bounded parsing or CRC step once the buffer is complete.
+	 */
+	public fn Service()
+	{
+		if (result != FileResult.Active || sector.busy) {
+			return
+		}
+
+		if (!sector.valid || sector.failed) {
+			result = FileResult.IoError
+			return
+		}
+
+		match (phase)
+		{
+			PartitionPhase.Mbr =>
+			{
+				ParseMbr()
+			}
+			PartitionPhase.GptHeader =>
+			{
+				ParseGpt()
+			}
+			PartitionPhase.HeaderCrc =>
+			{
+				HeaderCrc()
+			}
+			PartitionPhase.TableCrc =>
+			{
+				TableCrc()
+			}
+			PartitionPhase.TableEntry =>
+			{
+				TableEntry()
+			}
+		}
+	}
+}

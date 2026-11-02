@@ -1,0 +1,45 @@
+namespace Livt.FileSystems
+
+/**
+ * One retained 512-byte sector. A single scheduled owner serializes all calls.
+ * An accepted Start invalidates the previous sector; Service advances copying without waiting
+ * for device completion. Cancellation drains the device before busy clears.
+ * Reads require valid; reset invalidates metadata without clearing payload RAM.
+ */
+interface ISectorBuffer
+{
+	// Retained copy/cancellation state and visibility of the current sector.
+	public busy: bool
+	public valid: bool
+	public failed: bool
+
+	/**
+	 * Starts one bounded sector read; false leaves ownership unchanged.
+	 */
+	fn Start(lba: uint) bool
+
+	/**
+	 * Advances at most one byte of copying or cancellation.
+	 */
+	fn Service()
+
+	/**
+	 * Requests cancellation and invalidates retained content.
+	 */
+	fn Cancel()
+
+	/**
+	 * Returns a byte at offset 0..511; invalid accesses return zero.
+	 */
+	fn ReadByte(offset: int) byte
+
+	/**
+	 * Returns a little-endian word; requires valid and offset 0..510.
+	 */
+	fn Read16(offset: int) uint
+
+	/**
+	 * Returns a little-endian double word; requires valid and offset 0..508.
+	 */
+	fn Read32(offset: int) uint
+}

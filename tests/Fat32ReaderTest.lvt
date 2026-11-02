@@ -1,0 +1,209 @@
+namespace Livt.FileSystems.Tests
+
+using Livt.IO
+using Livt.FileSystems
+
+/**
+ * Exercises the reader without USB, including slow consumption and bad media.
+ */
+@Test
+component Fat32ReaderTest
+{
+	// Owned fixture components; each test initializes the medium before use.
+	device: Fat32DiskModel
+	reader: Fat32Reader<SequentialRam<byte, 512>, 4096, 2>
+	name: ShortFileName
+
+	/**
+	 * Owns an isolated medium, bounded reader and filename helper.
+	 */
+	new()
+	{
+		device = new Fat32DiskModel()
+		reader = new Fat32Reader<SequentialRam<byte, 512>, 4096, 2>(device)
+		name = new ShortFileName()
+	}
+
+	/**
+	 * Normalizes a complete alias and configures the idle reader.
+	 */
+	fn Select(text: byte[])
+	{
+		name.Reset()
+
+		for (var index = 0; index < text.Length; index++) {
+			name.Append(text[index])
+		}
+
+		assert name.IsValid()
+
+		for (var index = 0; index < 11; index++) {
+			reader.SetNameByte(index, name.GetByte(index))
+		}
+	}
+
+	/**
+	 * Services a bounded job, optionally checking bytes under consumer backpressure.
+	 */
+	fn Drain(expected: FileResult, consume: bool)
+	{
+		var turns = 0
+		var count: uint = 0
+
+		while (reader.result == FileResult.Active && turns < 100000) {
+			reader.Service()
+
+			if (consume && (turns % 5) == 0) {
+				var value: byte
+
+				if (reader.TryReadByte(value)) {
+					var expectedByte = (count & 255) as byte
+
+					if (count >= 1024) {
+						expectedByte = ((count - 1024 + 33) & 255) as byte
+					} elif (count >= 512) {
+						expectedByte = ((count - 512 + 17) & 255) as byte
+					}
+
+					assert value == expectedByte
+					count++
+				}
+			}
+
+			turns++
+		}
+
+		assert reader.result == expected
+		assert device.GetReadState() == BlockReadState.Idle
+
+		if (consume && expected == FileResult.Success) {
+			assert count == 1031
+			assert reader.fileSize == 1031
+			assert reader.bytesRead == 1031
+		}
+	}
+
+	/**
+	 * Reads the same fragmented file from superfloppy, MBR and GPT layouts.
+	 */
+	@Test
+	fn LoadsFragmentedFileFromEachPartitionLayout()
+	{
+		for (var layout: byte = 0; layout < 3; layout++) {
+			device.Reset(layout, 0)
+			Select("data.bin".Encode())
+			assert reader.TryStart(true)
+			assert !reader.TryStart(false)
+			Drain(FileResult.Success, true)
+		}
+	}
+
+	/**
+	 * Checks listing retention, empty-file completion and missing-file results.
+	 */
+	@Test
+	fn ListsRetainedAliasesAndHandlesEmptyAndMissingFiles()
+	{
+		device.Reset(1, 0)
+		assert reader.TryStart(false)
+		var entries = 0
+		var turns = 0
+
+		while (reader.result == FileResult.Active && turns < 10000) {
+			reader.Service()
+
+			if (reader.entryReady) {
+				var first = reader.GetEntryName(0)
+				var size = reader.entrySize
+
+				for (var stall = 0; stall < 10; stall++) {
+					reader.Service()
+					assert reader.entryReady
+					assert reader.GetEntryName(0) == first
+					assert reader.entrySize == size
+				}
+
+				assert reader.ConsumeEntry()
+				assert !reader.ConsumeEntry()
+				entries++
+			}
+
+			turns++
+		}
+
+		assert reader.result == FileResult.Success
+		assert entries == 3
+		Select("EMPTY.BIN".Encode())
+		assert reader.TryStart(true)
+		Drain(FileResult.Success, false)
+		assert reader.fileSize == 0 && reader.bytesRead == 0
+		Select("MISSING.BIN".Encode())
+		assert reader.TryStart(true)
+		Drain(FileResult.NotFound, false)
+	}
+
+	/**
+	 * Rejects malformed geometry, checksums, file chains and traversal limits.
+	 */
+	@Test
+	fn RejectsCorruptGeometryCrcAndChains()
+	{
+		for (var fault: byte = 1; fault <= 9; fault++) {
+			var layout: byte = 0
+
+			if (fault == 3 || fault == 4) {
+				layout = 2
+			}
+
+			device.Reset(layout, fault)
+			Select("DATA.BIN".Encode())
+			assert reader.TryStart(true)
+			var expected = FileResult.Corrupt
+
+			if (fault >= 8) {
+				expected = FileResult.LimitExceeded
+			}
+
+			Drain(expected, false)
+			assert reader.bytesRead == 0
+		}
+	}
+
+	/**
+	 * Checks cancellation, partial-load invalidation, retry and failed byte reads.
+	 */
+	@Test
+	fn CancelsPendingReadsAndRejectsDisconnectDuringStreaming()
+	{
+		device.Reset(0, 0)
+		device.latency = 100
+		assert reader.TryStart(false)
+		reader.Cancel()
+		Drain(FileResult.Cancelled, false)
+		device.Reset(0, 0)
+		Select("DATA.BIN".Encode())
+		assert reader.TryStart(true)
+		var turns = 0
+
+		while (reader.bytesRead < 10 && turns < 10000) {
+			reader.Service()
+			var value: byte
+			reader.TryReadByte(value)
+			turns++
+		}
+
+		assert reader.bytesRead == 10
+		device.attached = false
+		var ignored: byte
+		assert !reader.TryReadByte(ignored)
+		Drain(FileResult.IoError, false)
+		assert reader.bytesRead == 10
+		device.Reset(0, 0)
+		assert reader.TryStart(true)
+		Drain(FileResult.Success, true)
+		device.Reset(0, 0)
+		device.rejectByte = true
+		assert reader.TryStart(true)
+		Drain(FileResult.IoError, false)
+	}
+}

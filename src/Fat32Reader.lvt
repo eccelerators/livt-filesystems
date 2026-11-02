@@ -1,0 +1,542 @@
+namespace Livt.FileSystems
+
+using Livt.IO
+
+/**
+ * Internal scheduled parser phases.
+ */
+enum Fat32ReaderPhase
+{
+	Discover
+	Mount
+	DirectoryEntry
+	DirectoryLink
+	ValidateLink
+	FileLink
+	FileData
+	Request
+	Finish
+}
+
+/**
+ * Read-only root-directory and file streaming over any IReadOnlyBlockDevice.
+ * One scheduled owner calls all methods; there is no hidden worker process.
+ * TryStart remounts the medium, Service advances bounded work, and output remains
+ * retained until consumed. FileResult.Success is the only successful end marker;
+ * bytes received before cancellation/error are an incomplete load and must be
+ * discarded by consumers requiring atomic data. No file-sized allocation occurs.
+ * The complete file chain is validated before streaming, including its final EOC.
+ * A generic sector provider controls BRAM/register storage and scheduled latency.
+ * The device and reader share the inherited clock/reset context; reset discards
+ * metadata and ownership without requiring payload RAM to be cleared.
+ */
+component Fat32Reader<STORAGE: IRam<byte> & new() = SequentialRam<byte, 512, MemoryStyle.Block>,
+	MAX_FILE_BYTES: uint = 16777216, MAX_DIRECTORY_CLUSTERS: uint = 256,
+	MAX_GPT_ENTRIES: int = 128>
+{
+	static assert MAX_FILE_BYTES > 0, "File limit must be positive"
+	static assert MAX_DIRECTORY_CLUSTERS > 0, "Directory traversal must be bounded"
+
+	// Borrowed block device and owned sector store, partition parser and geometry.
+	device: IReadOnlyBlockDevice
+	sector: SectorBuffer<STORAGE>
+	partition: PartitionReader<MAX_GPT_ENTRIES>
+	geometry: Fat32Geometry
+
+	// Retained operation and directory-entry metadata.
+	public result: FileResult
+	public fileSize: uint
+	public bytesRead: uint
+	public entryReady: bool
+	public entrySize: uint
+	public entryAttributes: byte
+	entryName: byte[11]
+	wantedName: byte[11]
+	loading: bool
+	phase: Fat32ReaderPhase
+
+	// Branches queue state directly; Service owns the scheduled device calls.
+	finishResult: FileResult
+	requestedLba: uint
+	nextPhase: Fat32ReaderPhase
+
+	// One cluster/sector cursor, reused for root scan, chain validation and streaming.
+	cluster: uint
+	currentLink: uint
+	firstFileCluster: uint
+	sectorInCluster: uint
+	offset: int
+	directoryClusters: uint
+	clustersRemaining: uint
+	remaining: uint
+
+	/**
+	 * Borrows exclusive block-device access and owns all filesystem state.
+	 */
+	new(device: IReadOnlyBlockDevice)
+	{
+		this.device = device
+		sector = new SectorBuffer<STORAGE>(device)
+		partition = new PartitionReader<MAX_GPT_ENTRIES>(sector)
+		geometry = new Fat32Geometry()
+	}
+
+	/**
+	 * Sets one alias byte at index 0..10 while no job is active.
+	 * Supply all eleven uppercase, space-padded 8+3 bytes before TryStart(true).
+	 * Invalid indices and calls during an active job are ignored.
+	 */
+	public fn SetNameByte(index: int, value: byte)
+	{
+		if (result != FileResult.Active && index >= 0 && index < 11) {
+			wantedName[index] = value
+		}
+	}
+
+	/**
+	 * Starts listing (load=false) or opening the configured alias (load=true).
+	 * False changes nothing. Accepted operations retain their result until another
+	 * accepted TryStart. Requires an idle, exclusively owned block device.
+	 */
+	public fn TryStart(load: bool) bool
+	{
+		if (result == FileResult.Active || !device.IsReady()
+			|| device.GetReadState() != BlockReadState.Idle || sector.busy) {
+			return false
+		}
+
+		result = FileResult.Active
+		entryReady = false
+		fileSize = 0
+		bytesRead = 0
+		loading = load
+		phase = Fat32ReaderPhase.Discover
+
+		if (device.GetBlockSize() != 512) {
+			finishResult = FileResult.Unsupported
+			entryReady = false
+			phase = Fat32ReaderPhase.Finish
+		} else {
+			partition.Start(device.GetBlockCount())
+		}
+
+		return true
+	}
+
+	/**
+	 * Requests cancellation; Service drains any transport request before completion.
+	 */
+	public fn Cancel()
+	{
+		if (result == FileResult.Active) {
+			finishResult = FileResult.Cancelled
+			entryReady = false
+			phase = Fat32ReaderPhase.Finish
+		}
+	}
+
+	/**
+	 * Returns one retained 8+3 name byte at index 0..10 while entryReady.
+	 * Returns zero otherwise; raw media bytes may need sanitizing for display.
+	 */
+	public fn GetEntryName(index: int) byte
+	{
+		if (!entryReady || index < 0 || index >= 11) {
+			return 0
+		}
+
+		return entryName[index]
+	}
+
+	/**
+	 * Releases a listed entry; false leaves state unchanged.
+	 */
+	public fn ConsumeEntry() bool
+	{
+		if (!entryReady) {
+			return false
+		}
+
+		entryReady = false
+		return true
+	}
+
+	/**
+	 * Transfers at most one file byte, preserving it under caller backpressure.
+	 * False yields zero and consumes nothing. Service must run between calls.
+	 */
+	public fn TryReadByte(value: out byte) bool
+	{
+		value = 0
+
+		if (result != FileResult.Active || phase != Fat32ReaderPhase.FileData || !sector.valid
+			|| sector.busy || offset >= 512 || remaining == 0 || !device.IsReady()) {
+			return false
+		}
+
+		value = sector.ReadByte(offset)
+		offset++
+		remaining--
+		bytesRead++
+		return true
+	}
+
+	/**
+	 * Mounts the selected FAT32 volume and starts the root directory cursor.
+	 */
+	fn Mount()
+	{
+		if (!geometry.Parse(sector, partition.start, partition.length)) {
+			finishResult = FileResult.Corrupt
+			entryReady = false
+			phase = Fat32ReaderPhase.Finish
+			return
+		}
+
+		cluster = geometry.rootCluster
+		directoryClusters = 1
+		sectorInCluster = 0
+		offset = 0
+		requestedLba = geometry.ClusterLba(cluster)
+		nextPhase = Fat32ReaderPhase.DirectoryEntry
+		phase = Fat32ReaderPhase.Request
+	}
+
+	/**
+	 * Parses one root entry; skips deleted, LFN and volume-label entries.
+	 */
+	fn DirectoryEntry()
+	{
+		if (entryReady) {
+			return
+		}
+
+		if (offset == 512) {
+			AdvanceSector(Fat32ReaderPhase.DirectoryEntry, Fat32ReaderPhase.DirectoryLink)
+			return
+		}
+
+		var first = sector.ReadByte(offset)
+
+		if (first == 0) {
+			if (loading) {
+				finishResult = FileResult.NotFound
+				entryReady = false
+				phase = Fat32ReaderPhase.Finish
+			} else {
+				finishResult = FileResult.Success
+				entryReady = false
+				phase = Fat32ReaderPhase.Finish
+			}
+
+			return
+		}
+
+		entryAttributes = sector.ReadByte(offset + 11)
+
+		if (first == 0xE5 || (entryAttributes & 8) != 0) {
+			offset = offset + 32
+			return
+		}
+
+		var matches = true
+
+		for (var index = 0; index < 11; index++) {
+			var value = sector.ReadByte(offset + index)
+			entryName[index] = value
+
+			if (value != wantedName[index]) {
+				matches = false
+			}
+		}
+
+		entrySize = sector.Read32(offset + 28)
+
+		if (loading && matches && (entryAttributes & 16) == 0) {
+			firstFileCluster = (sector.Read16(offset + 20) << 16) | sector.Read16(offset + 26)
+			fileSize = entrySize
+			OpenFile()
+			return
+		}
+
+		offset = offset + 32
+
+		if (!loading) {
+			entryReady = true
+		}
+	}
+
+	/**
+	 * Starts exact-length chain validation before any payload is delivered.
+	 */
+	fn OpenFile()
+	{
+		if (fileSize > MAX_FILE_BYTES) {
+			finishResult = FileResult.LimitExceeded
+			entryReady = false
+			phase = Fat32ReaderPhase.Finish
+			return
+		}
+
+		if (fileSize == 0) {
+			if (firstFileCluster != 0) {
+				finishResult = FileResult.Corrupt
+				entryReady = false
+				phase = Fat32ReaderPhase.Finish
+			} else {
+				finishResult = FileResult.Success
+				entryReady = false
+				phase = Fat32ReaderPhase.Finish
+			}
+
+			return
+		}
+
+		if (!geometry.IsCluster(firstFileCluster)) {
+			finishResult = FileResult.Corrupt
+			entryReady = false
+			phase = Fat32ReaderPhase.Finish
+			return
+		}
+
+		var lastByte = fileSize - 1
+		var lastSector = lastByte >> 9
+		var lastCluster = lastSector >> geometry.clusterShift
+		clustersRemaining = lastCluster + 1
+
+		if (clustersRemaining > geometry.clusterCount) {
+			finishResult = FileResult.Corrupt
+			entryReady = false
+			phase = Fat32ReaderPhase.Finish
+			return
+		}
+
+		cluster = firstFileCluster
+		requestedLba = geometry.fatStart + (cluster >> 7)
+		nextPhase = Fat32ReaderPhase.ValidateLink
+		phase = Fat32ReaderPhase.Request
+	}
+
+	/**
+	 * Moves within a cluster or fetches its FAT link at the cluster boundary.
+	 */
+	fn AdvanceSector(dataPhase: Fat32ReaderPhase, fatPhase: Fat32ReaderPhase)
+	{
+		sectorInCluster++
+		offset = 0
+
+		if (sectorInCluster < geometry.sectorsPerCluster) {
+			requestedLba = geometry.ClusterLba(cluster) + sectorInCluster
+			nextPhase = dataPhase
+			phase = Fat32ReaderPhase.Request
+		} else {
+			requestedLba = geometry.fatStart + (cluster >> 7)
+			nextPhase = fatPhase
+			phase = Fat32ReaderPhase.Request
+		}
+	}
+
+	/**
+	 * Follows a bounded directory chain; corrupt cycles eventually hit the limit.
+	 */
+	fn DirectoryLink()
+	{
+		var next = currentLink
+
+		if (next >= 0x0FFFFFF8) {
+			if (loading) {
+				finishResult = FileResult.NotFound
+				entryReady = false
+				phase = Fat32ReaderPhase.Finish
+			} else {
+				finishResult = FileResult.Success
+				entryReady = false
+				phase = Fat32ReaderPhase.Finish
+			}
+
+			return
+		}
+
+		if (!geometry.IsCluster(next)) {
+			finishResult = FileResult.Corrupt
+			entryReady = false
+			phase = Fat32ReaderPhase.Finish
+			return
+		}
+
+		if (directoryClusters >= MAX_DIRECTORY_CLUSTERS || directoryClusters >= geometry.clusterCount) {
+			finishResult = FileResult.LimitExceeded
+			entryReady = false
+			phase = Fat32ReaderPhase.Finish
+			return
+		}
+
+		directoryClusters++
+		cluster = next
+		sectorInCluster = 0
+		offset = 0
+		requestedLba = geometry.ClusterLba(cluster)
+		nextPhase = Fat32ReaderPhase.DirectoryEntry
+		phase = Fat32ReaderPhase.Request
+	}
+
+	/**
+	 * Requires exactly the number of clusters implied by file size, ending in EOC.
+	 */
+	fn ValidateLink()
+	{
+		var next = currentLink
+		clustersRemaining--
+
+		if (clustersRemaining == 0) {
+			if (next < 0x0FFFFFF8) {
+				finishResult = FileResult.Corrupt
+				entryReady = false
+				phase = Fat32ReaderPhase.Finish
+				return
+			}
+
+			cluster = firstFileCluster
+			sectorInCluster = 0
+			offset = 0
+			remaining = fileSize
+			requestedLba = geometry.ClusterLba(cluster)
+			nextPhase = Fat32ReaderPhase.FileData
+			phase = Fat32ReaderPhase.Request
+		} elif (!geometry.IsCluster(next)) {
+			finishResult = FileResult.Corrupt
+			entryReady = false
+			phase = Fat32ReaderPhase.Finish
+		} else {
+			cluster = next
+			requestedLba = geometry.fatStart + (cluster >> 7)
+			nextPhase = Fat32ReaderPhase.ValidateLink
+			phase = Fat32ReaderPhase.Request
+		}
+	}
+
+	/**
+	 * Follows a validated file link; still rejects invalid live-medium changes.
+	 */
+	fn FileLink()
+	{
+		var next = currentLink
+
+		if (!geometry.IsCluster(next)) {
+			finishResult = FileResult.Corrupt
+			entryReady = false
+			phase = Fat32ReaderPhase.Finish
+			return
+		}
+
+		cluster = next
+		sectorInCluster = 0
+		offset = 0
+		requestedLba = geometry.ClusterLba(cluster)
+		nextPhase = Fat32ReaderPhase.FileData
+		phase = Fat32ReaderPhase.Request
+	}
+
+	/**
+	 * Advances one bounded step; waits naturally on transport and consumer stalls.
+	 */
+	public fn Service()
+	{
+		if (result != FileResult.Active) {
+			return
+		}
+
+		if (phase == Fat32ReaderPhase.Finish) {
+			sector.Cancel()
+			sector.Service()
+
+			if (!sector.busy) {
+				result = finishResult
+			}
+
+			return
+		}
+
+		sector.Service()
+
+		if (!device.IsReady() || sector.failed) {
+			finishResult = FileResult.IoError
+			entryReady = false
+			phase = Fat32ReaderPhase.Finish
+			return
+		}
+
+		if (sector.busy) {
+			return
+		}
+
+		if (phase == Fat32ReaderPhase.DirectoryLink || phase == Fat32ReaderPhase.ValidateLink
+			|| phase == Fat32ReaderPhase.FileLink) {
+			currentLink = sector.Read32(((cluster & 127) * 4) as int) & 0x0FFFFFFF
+		}
+
+		match (phase)
+		{
+			Fat32ReaderPhase.Request =>
+			{
+				if (sector.Start(requestedLba)) {
+					phase = nextPhase
+				} else {
+					finishResult = FileResult.IoError
+					entryReady = false
+					phase = Fat32ReaderPhase.Finish
+				}
+			}
+			Fat32ReaderPhase.Discover =>
+			{
+				partition.Service()
+
+				if (partition.result == FileResult.Success) {
+					requestedLba = partition.start
+					nextPhase = Fat32ReaderPhase.Mount
+					phase = Fat32ReaderPhase.Request
+				} elif (partition.result != FileResult.Active) {
+					finishResult = partition.result
+					entryReady = false
+					phase = Fat32ReaderPhase.Finish
+				}
+			}
+			Fat32ReaderPhase.Mount =>
+			{
+				Mount()
+			}
+			Fat32ReaderPhase.DirectoryEntry =>
+			{
+				DirectoryEntry()
+			}
+			Fat32ReaderPhase.DirectoryLink =>
+			{
+				DirectoryLink()
+			}
+			Fat32ReaderPhase.ValidateLink =>
+			{
+				ValidateLink()
+			}
+			Fat32ReaderPhase.FileLink =>
+			{
+				FileLink()
+			}
+			Fat32ReaderPhase.FileData =>
+			{
+				if (remaining == 0) {
+					finishResult = FileResult.Success
+					entryReady = false
+					phase = Fat32ReaderPhase.Finish
+				} elif (offset == 512) {
+					AdvanceSector(Fat32ReaderPhase.FileData, Fat32ReaderPhase.FileLink)
+				}
+			}
+			_ =>
+			{
+				finishResult = FileResult.Corrupt
+				entryReady = false
+				phase = Fat32ReaderPhase.Finish
+			}
+		}
+	}
+}

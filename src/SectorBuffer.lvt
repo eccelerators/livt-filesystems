@@ -1,0 +1,137 @@
+namespace Livt.FileSystems
+
+using Livt.IO
+
+/**
+ * Owns configurable 512-byte storage and borrows the block device's only client.
+ * BRAM is the default; any serialized IRam provider with at least 512 cells works.
+ * Provider latency is preserved. The underlying device retains its sector until
+ * copying completes. Service also invalidates copied bytes when media disappears.
+ */
+component SectorBuffer<STORAGE: IRam<byte> & new() = SequentialRam<byte, 512, MemoryStyle.Block>> : ISectorBuffer
+{
+	// Borrowed exclusive block-device client and owned sector memory.
+	device: IReadOnlyBlockDevice
+	memory: STORAGE
+
+	// Copy cursor and cancellation state, independent of payload RAM contents.
+	index: int
+	cancelling: bool
+
+	/**
+	 * Binds a device in the same clock/reset context and allocates one sector.
+	 */
+	new(device: IReadOnlyBlockDevice)
+	{
+		this.device = device
+		memory = new STORAGE()
+	}
+
+	/**
+	 * Accepts an LBA only from a ready, idle device with 512-byte blocks.
+	 * True reserves the read and invalidates old content; call Service to complete.
+	 * False preserves this buffer state and does not acquire device ownership.
+	 */
+	override fn Start(lba: uint) bool
+	{
+		if (busy || !memory.IsValidAddress(511) || !device.IsReady()
+			|| device.GetBlockSize() != 512 || !device.TryReadBlock(lba)) {
+			return false
+		}
+
+		busy = true
+		valid = false
+		failed = false
+		cancelling = false
+		index = 0
+		return true
+	}
+
+	/**
+	 * Copies one byte or releases a terminal device completion.
+	 */
+	override fn Service()
+	{
+		if (!device.IsReady()) {
+			valid = false
+			failed = true
+		}
+
+		if (!busy) {
+			return
+		}
+
+		var status = device.GetReadState()
+
+		if (status == BlockReadState.Active) {
+			return
+		}
+
+		if (!cancelling && !failed && status == BlockReadState.Complete) {
+			var value: byte
+
+			if (device.TryReadByte(index, value)) {
+				memory.Write(index, value)
+				index++
+
+				if (index < 512) {
+					return
+				}
+
+				valid = true
+			} else {
+				failed = true
+			}
+		} else {
+			failed = true
+		}
+
+		device.ReleaseRead()
+		busy = false
+	}
+
+	/**
+	 * Invalidates bytes immediately; callers keep servicing until busy is false.
+	 */
+	override fn Cancel()
+	{
+		valid = false
+		cancelling = true
+
+		if (busy) {
+			device.CancelRead()
+		}
+	}
+
+	/**
+	 * Returns zero for invalid content or offsets.
+	 */
+	override fn ReadByte(offset: int) byte
+	{
+		if (!valid || offset < 0 || offset >= 512) {
+			return 0
+		}
+
+		return memory.Read(offset)
+	}
+
+	/**
+	 * Reads a little-endian word through scheduled storage calls.
+	 * Requires valid content and offset 0..510; calls must remain serialized.
+	 */
+	override fn Read16(offset: int) uint
+	{
+		var result = ReadByte(offset) as uint
+		return result | ((ReadByte(offset + 1) as uint) << 8)
+	}
+
+	/**
+	 * Reads a little-endian double word through scheduled storage calls.
+	 * Requires valid content and offset 0..508; calls must remain serialized.
+	 */
+	override fn Read32(offset: int) uint
+	{
+		var result = Read16(offset)
+		return result | (Read16(offset + 2) << 16)
+	}
+}

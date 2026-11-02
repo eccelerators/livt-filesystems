@@ -1,0 +1,17 @@
+namespace Livt.FileSystems
+
+/**
+ * Retained operation status; Success alone makes a streamed file complete.
+ */
+enum FileResult
+{
+	Idle
+	Active
+	Success
+	NotFound
+	Unsupported
+	Corrupt
+	IoError
+	Cancelled
+	LimitExceeded
+}

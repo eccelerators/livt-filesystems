@@ -1,0 +1,56 @@
+namespace Livt.FileSystems.Tests
+
+using Livt.FileSystems
+
+/**
+ * Checks exact 8.3 bounds, case normalization and path rejection.
+ */
+@Test
+component ShortFileNameTest
+{
+	// Owned parser reset before every input case.
+	name: ShortFileName
+
+	/**
+	 * Owns the incremental short-name parser.
+	 */
+	new()
+	{
+		name = new ShortFileName()
+	}
+
+	/**
+	 * Resets the parser for each input and checks the expected acceptance.
+	 */
+	fn Parse(text: byte[], valid: bool)
+	{
+		name.Reset()
+
+		for (var index = 0; index < text.Length; index++) {
+			name.Append(text[index])
+		}
+
+		assert name.IsValid() == valid
+	}
+
+	/**
+	 * Checks padded aliases, exact bounds, empty names and unsupported paths.
+	 */
+	@Test
+	fn NormalizesAndRejectsInvalidNames()
+	{
+		Parse("data.bin".Encode(), true)
+		assert name.GetByte(0) == 68
+		assert name.GetByte(4) == 32
+		assert name.GetByte(8) == 66
+		Parse("ABCDEFGH.XYZ".Encode(), true)
+		Parse("README".Encode(), true)
+		Parse("TOO_LONG1.BIN".Encode(), false)
+		Parse("DATA.BINX".Encode(), false)
+		Parse("DATA.".Encode(), false)
+		Parse(".BIN".Encode(), false)
+		Parse("A..B".Encode(), false)
+		Parse("A/B.BIN".Encode(), false)
+		Parse("".Encode(), false)
+	}
+}

@@ -1,0 +1,19 @@
+[project]
+name = "Livt.FileSystems"
+version = "0.0.1"
+path = "src"
+outdir = "out"
+
+[dependencies]
+"Livt.IO" = "1.7.0"
+"Livt.Utils" = "1.1.0"
+
+[tests]
+path = "tests"
+components = ["Fat32ReaderTest", "Fat32ArrayStorageTest", "ShortFileNameTest"]
+
+[build.debug]
+warnings = ["all"]
+
+[build.release]
+warnings = ["all"]

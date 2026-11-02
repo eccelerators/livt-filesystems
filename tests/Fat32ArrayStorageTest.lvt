@@ -1,0 +1,50 @@
+namespace Livt.FileSystems.Tests
+
+using Livt.IO
+using Livt.FileSystems
+
+/**
+ * Ensures the same reader works with register-array storage and its call latency.
+ */
+@Test
+component Fat32ArrayStorageTest
+{
+	// Owned fixture components; each test initializes the medium before use.
+	device: Fat32DiskModel
+	reader: Fat32Reader<ArrayRam<byte, 512>>
+
+	/**
+	 * Owns a disk fixture and a reader with a register-array sector provider.
+	 */
+	new()
+	{
+		device = new Fat32DiskModel()
+		reader = new Fat32Reader<ArrayRam<byte, 512>>(device)
+	}
+
+	/**
+	 * Lists all retained root entries through the alternate storage provider.
+	 */
+	@Test
+	fn ListsUsingArrayStorage()
+	{
+		device.Reset(0, 0)
+		assert reader.TryStart(false)
+		var turns = 0
+		var count = 0
+
+		while (reader.result == FileResult.Active && turns < 5000) {
+			reader.Service()
+
+			if (reader.entryReady) {
+				count++
+				reader.ConsumeEntry()
+			}
+
+			turns++
+		}
+
+		assert reader.result == FileResult.Success
+		assert count == 3
+	}
+}

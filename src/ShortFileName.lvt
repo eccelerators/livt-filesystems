@@ -1,0 +1,94 @@
+namespace Livt.FileSystems
+
+/**
+ * Incremental ASCII 8.3 filename normalization. Accepts letters, digits, underscore
+ * and hyphen, with one optional dot. Reset starts a new name. Invalid characters
+ * or lengths invalidate the entire name until Reset; no truncation occurs.
+ * Call Reset before appending the first name. One scheduled owner serializes calls.
+ */
+component ShortFileName
+{
+	// Space-padded alias and parser progress for the current name.
+	name: byte[11]
+	baseLength: int
+	extensionLength: int
+	dot: bool
+	invalid: bool
+
+	/**
+	 * Clears the name to its FAT space-padded representation.
+	 */
+	public fn Reset()
+	{
+		baseLength = 0
+		extensionLength = 0
+		dot = false
+		invalid = false
+
+		for (var index = 0; index < 11; index++) {
+			name[index] = 32
+		}
+	}
+
+	/**
+	 * Adds one character; lowercase ASCII is normalized to uppercase.
+	 */
+	public fn Append(value: byte)
+	{
+		if (invalid) {
+			return
+		}
+
+		if (value == 46) {
+			invalid = dot || baseLength == 0
+			dot = true
+			return
+		}
+
+		var character = value
+
+		if (character >= 97 && character <= 122) {
+			character = (character as int - 32) as byte
+		}
+
+		if (!((character >= 65 && character <= 90) || (character >= 48 && character <= 57)
+			|| character == 95 || character == 45)) {
+			invalid = true
+			return
+		}
+
+		if (dot) {
+			if (extensionLength == 3) {
+				invalid = true
+			} else {
+				name[8 + extensionLength] = character
+				extensionLength++
+			}
+		} elif (baseLength == 8) {
+			invalid = true
+		} else {
+			name[baseLength] = character
+			baseLength++
+		}
+	}
+
+	/**
+	 * True only for a complete supported name, including a nonempty dotted extension.
+	 */
+	public fn IsValid() bool
+	{
+		return !invalid && baseLength > 0 && (!dot || extensionLength > 0)
+	}
+
+	/**
+	 * Returns one space-padded alias byte; requires IsValid and index 0..10.
+	 */
+	public fn GetByte(index: int) byte
+	{
+		if (index < 0 || index >= 11) {
+			return 0
+		}
+
+		return name[index]
+	}
+}
