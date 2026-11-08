@@ -2,6 +2,14 @@
 
 All notable changes to this package are documented here.
 
+## 0.0.2
+
+### Changed
+
+- Prepare package discovery metadata and publish the README, changelog and
+  license alongside the existing FAT32 and partition-reader components.
+- Update dependencies to Livt.IO 1.8.1 and Livt.Utils 1.1.1.
+
 ## 0.0.1
 
 ### Added

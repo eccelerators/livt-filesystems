@@ -1,12 +1,25 @@
 [project]
 name = "Livt.FileSystems"
-version = "0.0.1"
+version = "0.0.2"
+description = "Bounded, read-only FAT32 file streaming and partition discovery for Livt FPGA applications."
+authors = ["Denis Vasilík"]
+repository = "https://github.com/eccelerators/livt-filesystems"
+homepage = "https://github.com/eccelerators/livt-filesystems"
+keywords = ["fpga", "filesystem", "fat32", "storage", "gpt"]
+license = "MIT"
 path = "src"
 outdir = "out"
 
+[project.organization]
+name = "Eccelerators GmbH"
+website = "https://eccelerators.com"
+
+[publish]
+files = ["README.md", "CHANGELOG.md", "LICENSE"]
+
 [dependencies]
-"Livt.IO" = "1.7.0"
-"Livt.Utils" = "1.1.0"
+"Livt.IO" = "1.8.1"
+"Livt.Utils" = "1.1.1"
 
 [tests]
 path = "tests"

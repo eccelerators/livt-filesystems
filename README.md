@@ -8,7 +8,7 @@ the same filesystem reader.
 
 See [CHANGELOG.md](CHANGELOG.md) for release notes.
 
-Version 0.0.1 provides:
+Version 0.0.2 provides:
 
 - `Fat32Reader`: root-directory listing and short-name file streaming.
 - `PartitionReader`: bounded GPT, primary MBR and unpartitioned-volume discovery.
@@ -21,10 +21,10 @@ Version 0.0.1 provides:
 
 ```toml
 [dependencies]
-"Livt.FileSystems" = "0.0.1"
+"Livt.FileSystems" = "0.0.2"
 ```
 
-The package depends on published `Livt.IO 1.7.0` and `Livt.Utils 1.1.0`.
+The package depends on `Livt.IO 1.8.1` and `Livt.Utils 1.1.1`.
 Run `livt sync` to resolve them. Applications using `IReadOnlyBlockDevice` or
 storage-provider types directly should also declare `Livt.IO`. The package has
 no USB, UART, CLI or board dependency.
